@@ -1025,6 +1025,9 @@ int copy_page_range(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 			!vma->anon_vma)
 		return 0;
 
+	if (is_xip_hugetlb_mapping(vma))
+		return 0;
+
 	if (is_vm_hugetlb_page(vma))
 		return copy_hugetlb_page_range(dst_mm, src_mm, vma);
 
@@ -1307,6 +1310,9 @@ static void unmap_single_vma(struct mmu_gather *tlb,
 				__unmap_hugepage_range_final(tlb, vma, start, end, NULL);
 				i_mmap_unlock_write(vma->vm_file->f_mapping);
 			}
+		} else if (is_xip_hugetlb_mapping(vma)) {
+			unmap_xip_hugetlb_range(vma, start, end);
+			start = end;
 		} else
 			unmap_page_range(tlb, vma, start, end, details);
 	}
@@ -3295,6 +3301,18 @@ int handle_mm_fault(struct mm_struct *mm, struct vm_area_struct *vma,
 	/* do counter updates before entering really critical section. */
 	check_sync_rss_stat(current);
 
+	if (is_xip_hugetlb_mapping(vma)) {
+		int err;
+		struct vm_fault vmf;
+		vmf.virtual_address = (void __user *)(address & PAGE_MASK);
+		vmf.pgoff = (((address & PAGE_MASK) - vma->vm_start) >> PAGE_SHIFT);
+		vmf.flags = flags;
+		vmf.page = NULL;
+		err = vma->vm_ops->fault(vma, &vmf);
+		if (!err || (err == VM_FAULT_NOPAGE))
+			return 0;
+	}
+
 	/*
 	 * Enable the memcg OOM handling for faults triggered in user
 	 * space.  Kernel faults are handled more gracefully.
@@ -3374,6 +3392,94 @@ int __pmd_alloc(struct mm_struct *mm, pud_t *pud, unsigned long address)
 	return 0;
 }
 #endif /* __PAGETABLE_PMD_FOLDED */
+
+/****************************************************************************/
+/* XIP_HUGETLB support */
+pte_t *pte_offset_pagesz(struct mm_struct *mm, unsigned long addr,
+						unsigned long *sz)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pmd_t *pmd = NULL;
+
+	pgd = pgd_offset(mm, addr);
+	if (!pgd_present(*pgd)) {
+		*sz = PGDIR_SIZE;
+		return (pte_t *)pgd;
+	}
+
+	pud = pud_offset(pgd, addr);
+	if (pud_none(*pud) || pud_large(*pud)) {
+		*sz = PUD_SIZE;
+		return (pte_t *)pud;
+	}
+	pmd = pmd_offset(pud, addr);
+	//if (pmd_none(*pmd) || pmd_large(*pmd)) {
+	*sz = PMD_SIZE;
+	return (pte_t *)pmd;
+}
+EXPORT_SYMBOL(pte_offset_pagesz);
+
+pte_t *pte_alloc_pagesz(struct mm_struct *mm, unsigned long addr,
+						unsigned long sz)
+{
+	pgd_t *pgd;
+	pud_t *pud;
+	pte_t *pte = NULL;
+
+	pgd = pgd_offset(mm, addr);
+	pud = pud_alloc(mm, pgd, addr);
+	if (pud) {
+		if (sz == PUD_SIZE) {
+			pte = (pte_t *)pud;
+		} else {
+			BUG_ON(sz != PMD_SIZE);
+			pte = (pte_t *) pmd_alloc(mm, pud, addr);
+		}
+	}
+	BUG_ON(pte && !pte_none(*pte) && !pte_huge(*pte));
+
+	return pte;
+}
+EXPORT_SYMBOL(pte_alloc_pagesz);
+
+static void __unmap_xip_hugetlb_range(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address;
+	pte_t *ptep;
+	pte_t pte;
+	unsigned long sz;
+
+	WARN_ON(!is_xip_hugetlb_mapping(vma));
+
+	mmu_notifier_invalidate_range_start(mm, start, end);
+	spin_lock(&mm->page_table_lock);
+	for (address = start, sz=PMD_SIZE; address < end; address += sz) {
+		ptep = pte_offset_pagesz(mm, address, &sz);
+		if (!ptep)
+			continue;
+
+		pte = ptep_get_and_clear(mm, address, ptep);
+		if (pte_none(pte))
+			continue;
+	}
+	flush_tlb_range(vma, start, end);
+	spin_unlock(&mm->page_table_lock);
+	mmu_notifier_invalidate_range_end(mm, start, end);
+}
+
+void unmap_xip_hugetlb_range(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	i_mmap_lock_write(vma->vm_file->f_mapping);
+	__unmap_xip_hugetlb_range(vma, start, end);
+	i_mmap_unlock_write(vma->vm_file->f_mapping);
+}
+EXPORT_SYMBOL(unmap_xip_hugetlb_range);
+
+/****************************************************************************/
 
 static int __follow_pte(struct mm_struct *mm, unsigned long address,
 		pte_t **ptepp, spinlock_t **ptlp)
