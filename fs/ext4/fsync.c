@@ -34,6 +34,38 @@
 
 #include <trace/events/ext4.h>
 
+#define	CACHELINE_SIZE	64
+
+#define _mm_clflush(addr)\
+	asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
+#define _mm_clflushopt(addr)\
+	asm volatile(".byte 0x66; clflush %0" : "+m" (*(volatile char *)(addr)))
+#define _mm_clwb(addr)\
+	asm volatile(".byte 0x66; xsaveopt %0" : "+m" (*(volatile char *)(addr)))
+#define _mm_pcommit()\
+	asm volatile(".byte 0x66, 0x0f, 0xae, 0xf8")
+
+static inline void PERSISTENT_BARRIER(void)
+{
+	asm volatile ("sfence\n" : : );
+//	_mm_pcommit();
+}
+
+static inline void ext4_flush_buffer(void *buf, uint32_t len, bool fence)
+{
+	uint32_t i;
+	len = len + ((unsigned long)(buf) & (CACHELINE_SIZE - 1));
+	for (i = 0; i < len; i += CACHELINE_SIZE)
+		asm volatile ("clflush %0\n" : "+m" (*(char *)(buf + i)));
+//		_mm_clwb(buf + i);
+	/* Do a fence only if asked. We often don't need to do a fence
+	 * immediately after clflush because even if we get context switched
+	 * between clflush and subsequent fence, the context switch operation
+	 * provides implicit fence. */
+	if (fence)
+		PERSISTENT_BARRIER();
+}
+
 /*
  * If we're not journaling and this is a just-created file, we have to
  * sync our parent directory (if it was freshly created) since
@@ -71,6 +103,81 @@ static int ext4_sync_parent(struct inode *inode)
 	}
 	iput(inode);
 	return ret;
+}
+
+static bool buffer_size_valid(struct buffer_head *bh)
+{
+	return bh->b_state != 0;
+}
+
+static long ext4_dax_get_addr(struct buffer_head *bh, void **addr,
+	unsigned blkbits)
+{
+	unsigned long pfn;
+	sector_t sector = bh->b_blocknr << (blkbits - 9);
+	return bdev_direct_access(bh->b_bdev, sector, addr, &pfn, bh->b_size);
+}
+
+static int ext4_dax_msync(struct file *file, loff_t start, loff_t end,
+	int datasync)
+{
+	struct inode *inode = file->f_mapping->host;
+	struct buffer_head bh1, *bh;
+	loff_t pos = start;
+	loff_t max = start;
+	loff_t bh_max = start;
+	void *addr;
+	int retval;
+
+	memset(&bh1, 0, sizeof(bh1));
+	bh = &bh1;
+
+	end = min(end, i_size_read(inode));
+
+	while (pos < end) {
+		unsigned len;
+		if (pos == max) {
+			unsigned blkbits = inode->i_blkbits;
+			sector_t block = pos >> blkbits;
+			unsigned first = pos - (block << blkbits);
+			long size;
+
+			if (pos == bh_max) {
+				bh->b_size = PAGE_ALIGN(end - pos);
+				bh->b_state = 0;
+				retval = ext4_get_block(inode, block, bh, 0);
+				if (retval)
+					break;
+				if (!buffer_size_valid(bh))
+					bh->b_size = 1 << blkbits;
+				bh_max = pos - first + bh->b_size;
+			} else {
+				unsigned done = bh->b_size -
+						(bh_max - (pos - first));
+				bh->b_blocknr += done >> blkbits;
+				bh->b_size -= done;
+			}
+
+			retval = ext4_dax_get_addr(bh, &addr, blkbits);
+			if (retval < 0)
+				break;
+			addr += first;
+			size = retval - first;
+			max = min(pos + size, end);
+		}
+
+		len = max - pos;
+
+		if (!len)
+			break;
+
+		ext4_flush_buffer(addr, len, 0);
+		pos += len;
+		addr += len;
+	}
+
+	PERSISTENT_BARRIER();
+	return 0;
 }
 
 /*
@@ -113,6 +220,11 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		goto out;
 	}
 
+	if (IS_DAX(inode) && mapping_mapped(file->f_mapping)) {
+		ext4_dax_msync(file, start, end, datasync);
+		goto journal_commit;
+	}
+
 	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
 	if (ret)
 		return ret;
@@ -135,6 +247,7 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		goto out;
 	}
 
+journal_commit:
 	commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
 	if (journal->j_flags & JBD2_BARRIER &&
 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
