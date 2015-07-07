@@ -189,8 +189,7 @@ static ssize_t dax_io(int rw, struct inode *inode, struct iov_iter *iter,
 		}
 
 		if (rw == WRITE) {
-			len = copy_from_iter(addr, max - pos, iter);
-			dax_flush_buffer(addr, len, 0);
+			len = copy_from_iter_nocache(addr, max - pos, iter);
 		} else if (!hole) {
 			len = copy_to_iter(addr, max - pos, iter);
 		} else {
