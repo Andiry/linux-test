@@ -29,6 +29,20 @@
 
 #define	CACHELINE_SIZE	64
 
+#define X86_FEATURE_PCOMMIT	( 9*32+22) /* PCOMMIT instruction */
+#define X86_FEATURE_CLFLUSHOPT	( 9*32+23) /* CLFLUSHOPT instruction */
+#define X86_FEATURE_CLWB	( 9*32+24) /* CLWB instruction */
+
+static inline bool arch_has_pcommit(void)
+{
+	return static_cpu_has(X86_FEATURE_PCOMMIT);
+}
+
+static inline bool arch_has_clwb(void)
+{
+	return static_cpu_has(X86_FEATURE_CLWB);
+}
+
 #define _mm_clflush(addr)\
 	asm volatile("clflush %0" : "+m" (*(volatile char *)(addr)))
 #define _mm_clflushopt(addr)\
@@ -41,16 +55,23 @@
 static inline void PERSISTENT_BARRIER(void)
 {
 	asm volatile ("sfence\n" : : );
-//	_mm_pcommit();
+	if (arch_has_pcommit()) {
+		_mm_pcommit();
+		asm volatile ("sfence\n" : : );
+	}
 }
 
 static inline void dax_flush_buffer(void *buf, uint32_t len, bool fence)
 {
 	uint32_t i;
 	len = len + ((unsigned long)(buf) & (CACHELINE_SIZE - 1));
-	for (i = 0; i < len; i += CACHELINE_SIZE)
-		asm volatile ("clflush %0\n" : "+m" (*(char *)(buf + i)));
-//		_mm_clwb(buf + i);
+	if (arch_has_clwb()) {
+		for (i = 0; i < len; i += CACHELINE_SIZE)
+			_mm_clwb(buf + i);
+	} else {
+		for (i = 0; i < len; i += CACHELINE_SIZE)
+			_mm_clflush(buf + i);
+	}
 	/* Do a fence only if asked. We often don't need to do a fence
 	 * immediately after clflush because even if we get context switched
 	 * between clflush and subsequent fence, the context switch operation
